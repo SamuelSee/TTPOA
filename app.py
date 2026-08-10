@@ -279,7 +279,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="card pos-section">
   <h2>🛒 Web Point of Sale (Send Payment to Phone)</h2>
   <div class="sub" style="margin-bottom:10px;">
-    Enter an amount here. Your Android app must be programmed to check <code>/api/device/poll</code> to pick up this request and start the NFC reader.
+    Enter an amount here. Payment will be staged first. The App is then programmed to check <code>/api/device/poll</code> to pick up this request and start the NFC reader.
   </div>
   <div class="row">
     <input type="number" id="posAmount" placeholder="Amount (e.g. 5.00)" value="5.00">
