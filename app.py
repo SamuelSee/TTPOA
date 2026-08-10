@@ -32,8 +32,8 @@ from flask import Flask, request, jsonify, Response
 app = Flask(__name__)
 
 # --- Fill these in ---
-ADYEN_API_KEY = os.environ.get("ADYEN_API_KEY", "AQEyhmfxKojPbRNKw0m/n3Q5qf3VaY9UCJ1+XWZe9W27jmlZispb0l7VwYmeav0x3x22xaEQwV1bDb7kfNy1WIxIIkxgBw==-OxYOHtYldQyklTTRPjk++GHK4Hft57yR4Y2w+lvn3sY=-i1i8sL3fPE(89P3b*W,")
-MERCHANT_ACCOUNT = os.environ.get("ADYEN_MERCHANT_ACCOUNT", "AdyenTechSupport_Samuel_TEST")
+ADYEN_API_KEY = os.environ.get("ADYEN_API_KEY", "")
+MERCHANT_ACCOUNT = os.environ.get("ADYEN_MERCHANT_ACCOUNT", "")
 
 # Optional: set this to require a shared secret before the dashboard/API will
 # do anything. Leave blank to disable (fine for local-only testing; set this
