@@ -51,6 +51,9 @@ _recent_calls = deque(maxlen=50)
 # Format: {"device_1": {"amount": "10.00", "currency": "EUR", "status": "pending"}}
 _pending_payments = {}
 
+# Flags to signal device setting reset/warmUp
+_pending_reset = {"device_1": False}
+
 
 def _log_call(kind, request_body, response_status, response_body):
     _recent_calls.appendleft({
@@ -162,21 +165,41 @@ def pos_charge():
     return jsonify({"message": "Payment staged for device."}), 200
 
 
+@app.route("/api/pos/reset", methods=["POST"])
+def pos_reset():
+    """Web UI calls this to tell the phone to sync/reset terminal settings."""
+    if not _check_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    
+    _pending_reset["device_1"] = True
+    _log_call("pos-reset", {}, 200, {"status": "reset_requested"})
+    return jsonify({"message": "Reset/Sync command sent to phone."}), 200
+
+
 @app.route("/api/device/poll", methods=["GET"])
 def device_poll():
-    """Android app calls this repeatedly to check for pending payments."""
-    payment = _pending_payments.get("device_1")
+    """Android app calls this repeatedly to check for pending payments or reset signals."""
     
+    # Check if a reset was requested
+    if _pending_reset.get("device_1"):
+        _pending_reset["device_1"] = False  # Clear the flag
+        return jsonify({
+            "has_payment": False,
+            "should_reset": True
+        }), 200
+
+    # Otherwise check for pending payments
+    payment = _pending_payments.get("device_1")
     if payment and payment["status"] == "pending":
-        # Mark as processing so we don't send it twice
         payment["status"] = "processing"
         return jsonify({
             "has_payment": True,
+            "should_reset": False,
             "amount": payment["amount"],
             "currency": payment["currency"]
         }), 200
         
-    return jsonify({"has_payment": False}), 200
+    return jsonify({"has_payment": False, "should_reset": False}), 200
 
 
 @app.route("/payment-result", methods=["POST"])
@@ -275,7 +298,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <h1>Tap to Pay - backend test console</h1>
 <div class="sub">Talks directly to this Flask backend.</div>
 
-<!-- NEW POS SECTION -->
+<!-- POS SECTION -->
 <div class="card pos-section">
   <h2>🛒 Web Point of Sale (Send Payment to Phone)</h2>
   <div class="sub" style="margin-bottom:10px;">
@@ -285,6 +308,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <input type="number" id="posAmount" placeholder="Amount (e.g. 5.00)" value="5.00">
     <input type="text" id="posCurrency" placeholder="Currency" value="EUR" style="max-width: 80px;">
     <button onclick="sendToPhone()">Send to Phone</button>
+  </div>
+  <div class="row" style="margin-top: 10px;">
+    <button class="secondary" onclick="resetPhone()">🔄 Sync / Reset Terminal</button>
   </div>
   <pre id="posResult" style="display:none; margin-top:12px;"></pre>
 </div>
@@ -333,6 +359,25 @@ async function sendToPhone() {
     });
     const data = await res.json();
     out.textContent = 'Success: ' + data.message + '\\n\\n(Now your Android app needs to poll /api/device/poll to see it)';
+  } catch (e) {
+    out.textContent = 'Error: ' + e;
+  }
+  loadRecent();
+}
+
+async function resetPhone() {
+  const secret = document.getElementById('dashSecret').value.trim();
+  const out = document.getElementById('posResult');
+  out.style.display = 'block';
+  out.textContent = 'Sending reset command to phone...';
+  
+  try {
+    const res = await fetch('/api/pos/reset', {
+      method: 'POST',
+      headers: {'content-type': 'application/json', 'x-dashboard-secret': secret}
+    });
+    const data = await res.json();
+    out.textContent = 'Command Sent: ' + data.message;
   } catch (e) {
     out.textContent = 'Error: ' + e;
   }
