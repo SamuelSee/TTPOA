@@ -47,6 +47,10 @@ ADYEN_AUTH_CERTIFICATE_URL = "https://softposconfig-test.adyen.com/softposconfig
 # restart -- this is a dev tool, not a persistence layer.
 _recent_calls = deque(maxlen=50)
 
+# Holds payments waiting to be picked up by the phone
+# Format: {"device_1": {"amount": "10.00", "currency": "EUR", "status": "pending"}}
+_pending_payments = {}
+
 
 def _log_call(kind, request_body, response_status, response_body):
     _recent_calls.appendleft({
@@ -136,6 +140,45 @@ def establish_session():
     }), 200
 
 
+@app.route("/api/pos/charge", methods=["POST"])
+def pos_charge():
+    """Web UI calls this to stage a payment for the phone."""
+    if not _check_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    
+    body = request.get_json(silent=True) or {}
+    amount = body.get("amount", "0")
+    currency = body.get("currency", "EUR")
+    
+    # In a real app, you'd target a specific phone/terminal ID. 
+    # For this stub, we'll use a hardcoded device ID: "device_1"
+    _pending_payments["device_1"] = {
+        "amount": amount,
+        "currency": currency,
+        "status": "pending"
+    }
+    
+    _log_call("pos-charge", body, 200, {"status": "payment_staged"})
+    return jsonify({"message": "Payment staged for device."}), 200
+
+
+@app.route("/api/device/poll", methods=["GET"])
+def device_poll():
+    """Android app calls this repeatedly to check for pending payments."""
+    payment = _pending_payments.get("device_1")
+    
+    if payment and payment["status"] == "pending":
+        # Mark as processing so we don't send it twice
+        payment["status"] = "processing"
+        return jsonify({
+            "has_payment": True,
+            "amount": payment["amount"],
+            "currency": payment["currency"]
+        }), 200
+        
+    return jsonify({"has_payment": False}), 200
+
+
 @app.route("/payment-result", methods=["POST"])
 def payment_result():
     """
@@ -209,7 +252,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .card { border: 1px solid #ddd; border-radius: 8px; padding: 18px 20px; margin-bottom: 18px; }
   .card h2 { font-size: 15px; margin: 0 0 10px; }
   .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
-  input[type=text] { flex: 1; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; }
+  input[type=text], input[type=number] { flex: 1; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; }
   button { padding: 8px 16px; border: none; border-radius: 6px; background: #0a5cff;
            color: white; font-size: 13px; cursor: pointer; }
   button:hover { background: #0847cc; }
@@ -224,16 +267,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .muted { color: #888; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
            background: #eee; margin-right: 6px; }
+  .pos-section { background: #eef5ff; border-color: #bbd6fe; }
 </style>
 </head>
 <body>
 
 <h1>Tap to Pay - backend test console</h1>
-<div class="sub">
-  Talks directly to this Flask backend. Note: this cannot trigger an actual
-  NFC card tap -- that only happens inside the Android app on a physical
-  phone. Use this to test the session-establishment call and inspect what
-  Adyen's servers return.
+<div class="sub">Talks directly to this Flask backend.</div>
+
+<!-- NEW POS SECTION -->
+<div class="card pos-section">
+  <h2>🛒 Web Point of Sale (Send Payment to Phone)</h2>
+  <div class="sub" style="margin-bottom:10px;">
+    Enter an amount here. Your Android app must be programmed to check <code>/api/device/poll</code> to pick up this request and start the NFC reader.
+  </div>
+  <div class="row">
+    <input type="number" id="posAmount" placeholder="Amount (e.g. 5.00)" value="5.00">
+    <input type="text" id="posCurrency" placeholder="Currency" value="EUR" style="max-width: 80px;">
+    <button onclick="sendToPhone()">Send to Phone</button>
+  </div>
+  <pre id="posResult" style="display:none; margin-top:12px;"></pre>
 </div>
 
 <div class="card">
@@ -241,21 +294,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div id="status">checking...</div>
 </div>
 
-<div class="card">
+<div class="card" style="display:none;">
   <h2>Dashboard secret</h2>
-  <div class="sub" style="margin-bottom:10px;">
-    Only needed if you've set DASHBOARD_SECRET as an environment variable on
-    the server. Stored in this browser tab only, never saved.
-  </div>
   <div class="row">
-    <input type="text" id="dashSecret" placeholder="x-dashboard-secret value (leave blank if not set)">
+    <input type="text" id="dashSecret" placeholder="x-dashboard-secret value">
   </div>
 </div>
 
 <div class="card">
   <h2>Test /establish-session</h2>
   <div class="row">
-    <input type="text" id="setupToken" placeholder="setupToken (from the Android app's authenticate() callback)">
+    <input type="text" id="setupToken" placeholder="setupToken">
   </div>
   <button onclick="testEstablish()">Send</button>
   <pre id="establishResult" style="display:none; margin-top:12px;"></pre>
@@ -268,30 +317,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+async function sendToPhone() {
+  const amount = document.getElementById('posAmount').value;
+  const currency = document.getElementById('posCurrency').value;
+  const secret = document.getElementById('dashSecret').value.trim();
+  const out = document.getElementById('posResult');
+  out.style.display = 'block';
+  out.textContent = 'Sending to queue...';
+  
+  try {
+    const res = await fetch('/api/pos/charge', {
+      method: 'POST',
+      headers: {'content-type': 'application/json', 'x-dashboard-secret': secret},
+      body: JSON.stringify({amount, currency})
+    });
+    const data = await res.json();
+    out.textContent = 'Success: ' + data.message + '\\n\\n(Now your Android app needs to poll /api/device/poll to see it)';
+  } catch (e) {
+    out.textContent = 'Error: ' + e;
+  }
+  loadRecent();
+}
+
 async function loadStatus(attempt) {
   attempt = attempt || 1;
   const el = document.getElementById('status');
-  if (attempt === 1) {
-    el.innerHTML = '<span class="muted">Checking (may take up to a minute if the server was asleep)...</span>';
-  }
   try {
-    const health = await fetch('/health').then(r => r.json());
     const cfg = await fetch('/api/config-check').then(r => r.json());
     let html = '<span class="status-ok">Server running</span><br>';
-    html += cfg.api_key_set
-      ? '<span class="status-ok">API key configured</span><br>'
-      : '<span class="status-bad">API key still a placeholder -- edit app.py</span><br>';
-    html += cfg.merchant_account_set
-      ? '<span class="status-ok">Merchant account: ' + cfg.merchant_account + '</span>'
-      : '<span class="status-bad">Merchant account still a placeholder -- edit app.py</span>';
+    html += cfg.api_key_set ? '<span class="status-ok">API key configured</span><br>' : '<span class="status-bad">API key missing</span><br>';
     el.innerHTML = html;
   } catch (e) {
-    if (attempt < 6) {
-      setTimeout(() => loadStatus(attempt + 1), 5000);
-      el.innerHTML = '<span class="muted">Still waking up server, retrying (' + attempt + '/6)...</span>';
-    } else {
-      el.innerHTML = '<span class="status-bad">Cannot reach backend</span> <button class="secondary" onclick="loadStatus(1)">Retry</button>';
-    }
+    el.innerHTML = '<span class="status-bad">Cannot reach backend</span>';
   }
 }
 
@@ -300,7 +357,6 @@ async function testEstablish() {
   const secret = document.getElementById('dashSecret').value.trim();
   const out = document.getElementById('establishResult');
   out.style.display = 'block';
-  out.textContent = 'Sending...';
   try {
     const res = await fetch('/establish-session', {
       method: 'POST',
@@ -322,15 +378,10 @@ async function loadRecent() {
     const calls = await fetch('/api/recent-calls', {
       headers: {'x-dashboard-secret': secret}
     }).then(r => r.json());
-    if (!calls.length) {
-      el.innerHTML = '<span class="muted">No calls yet.</span>';
-      return;
-    }
+    if (!calls.length) { el.innerHTML = '<span class="muted">No calls yet.</span>'; return; }
     el.innerHTML = calls.map(c => `
       <div class="log-entry">
-        <span class="badge">${c.time}</span>
-        <span class="badge">${c.kind}</span>
-        <span class="${c.status === 201 || c.status === 200 ? 'status-ok' : 'status-bad'}">status ${c.status}</span>
+        <span class="badge">${c.time}</span> <span class="badge">${c.kind}</span>
         <pre>${JSON.stringify(c.response, null, 2)}</pre>
       </div>
     `).join('');
