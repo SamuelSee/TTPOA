@@ -21,7 +21,7 @@ Setup:
      LAN IP (e.g. 192.168.x.x) and make sure the phone is on the same
      network, or use a tool like ngrok to tunnel it.
 """
-print("!!!!! FILE VERSION CHECK - IF YOU SEE THIS, THIS FILE IS RUNNING !!!!!")
+
 import os
 import time
 from collections import deque
@@ -32,8 +32,8 @@ from flask import Flask, request, jsonify, Response
 app = Flask(__name__)
 
 # --- Fill these in ---
-ADYEN_API_KEY = os.environ.get("ADYEN_API_KEY", "")
-MERCHANT_ACCOUNT = os.environ.get("ADYEN_MERCHANT_ACCOUNT", "")
+ADYEN_API_KEY = os.environ.get("ADYEN_API_KEY", "REPLACE_WITH_YOUR_CHECKOUT_WEBSERVICE_API_KEY")
+MERCHANT_ACCOUNT = os.environ.get("ADYEN_MERCHANT_ACCOUNT", "REPLACE_WITH_YOUR_MERCHANT_ACCOUNT")
 
 # Optional: set this to require a shared secret before the dashboard/API will
 # do anything. Leave blank to disable (fine for local-only testing; set this
@@ -134,6 +134,7 @@ def establish_session():
         "sdkData": data.get("sdkData"),
         "installationId": data.get("installationId"),
     }), 200
+
 
 @app.route("/payment-result", methods=["POST"])
 def payment_result():
@@ -267,8 +268,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-async function loadStatus() {
+async function loadStatus(attempt) {
+  attempt = attempt || 1;
   const el = document.getElementById('status');
+  if (attempt === 1) {
+    el.innerHTML = '<span class="muted">Checking (may take up to a minute if the server was asleep)...</span>';
+  }
   try {
     const health = await fetch('/health').then(r => r.json());
     const cfg = await fetch('/api/config-check').then(r => r.json());
@@ -281,7 +286,12 @@ async function loadStatus() {
       : '<span class="status-bad">Merchant account still a placeholder -- edit app.py</span>';
     el.innerHTML = html;
   } catch (e) {
-    el.innerHTML = '<span class="status-bad">Cannot reach backend</span>';
+    if (attempt < 6) {
+      setTimeout(() => loadStatus(attempt + 1), 5000);
+      el.innerHTML = '<span class="muted">Still waking up server, retrying (' + attempt + '/6)...</span>';
+    } else {
+      el.innerHTML = '<span class="status-bad">Cannot reach backend</span> <button class="secondary" onclick="loadStatus(1)">Retry</button>';
+    }
   }
 }
 
