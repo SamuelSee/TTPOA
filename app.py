@@ -23,13 +23,37 @@ Setup:
 """
 
 import os
+import json
 import time
 from collections import deque
 
 import requests
 from flask import Flask, request, jsonify, Response
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 app = Flask(__name__)
+
+# --- Firebase setup ---
+# FIREBASE_SERVICE_ACCOUNT_JSON should contain the *entire contents* of the
+# service account JSON file downloaded from Firebase console, as one string.
+_firebase_ready = False
+try:
+    firebase_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+    if firebase_json:
+        cred = credentials.Certificate(json.loads(firebase_json))
+        firebase_admin.initialize_app(cred)
+        _firebase_ready = True
+        print("--- Firebase initialized successfully ---")
+    else:
+        print("--- FIREBASE_SERVICE_ACCOUNT_JSON not set, push notifications disabled ---")
+except Exception as e:
+    print(f"--- Firebase initialization failed: {e} ---")
+# ---------------------
+
+# Holds the phone's current FCM token, sent up via /api/device/register-token.
+# Single-device model, same as before -- one test phone at a time.
+_device_fcm_token = {"token": None}
 
 # --- Fill these in ---
 ADYEN_API_KEY = os.environ.get("ADYEN_API_KEY", "REPLACE_WITH_YOUR_CHECKOUT_WEBSERVICE_API_KEY")
@@ -47,12 +71,16 @@ ADYEN_AUTH_CERTIFICATE_URL = "https://softposconfig-test.adyen.com/softposconfig
 # restart -- this is a dev tool, not a persistence layer.
 _recent_calls = deque(maxlen=50)
 
-# Holds payments waiting to be picked up by the phone
-# Format: {"device_1": {"amount": "10.00", "currency": "EUR", "status": "pending"}}
-_pending_payments = {}
-
-# Flags to signal device setting reset/warmUp
-_pending_reset = {"device_1": False}
+# In-memory queue for the "Web POS" remote-trigger feature. The Android app
+# polls /api/device/poll every ~3s; this holds whatever the dashboard queued
+# up most recently. Single-device, single-pending-item model -- good enough
+# for one test phone, not built for multiple devices/concurrent payments.
+_device_queue = {
+    "has_payment": False,
+    "amount": None,
+    "currency": None,
+    "should_reset": False,
+}
 
 
 def _log_call(kind, request_body, response_status, response_body):
@@ -143,65 +171,6 @@ def establish_session():
     }), 200
 
 
-@app.route("/api/pos/charge", methods=["POST"])
-def pos_charge():
-    """Web UI calls this to stage a payment for the phone."""
-    if not _check_secret():
-        return jsonify({"error": "unauthorized"}), 401
-    
-    body = request.get_json(silent=True) or {}
-    amount = body.get("amount", "0")
-    currency = body.get("currency", "EUR")
-    
-    # In a real app, you'd target a specific phone/terminal ID. 
-    # For this stub, we'll use a hardcoded device ID: "device_1"
-    _pending_payments["device_1"] = {
-        "amount": amount,
-        "currency": currency,
-        "status": "pending"
-    }
-    
-    _log_call("pos-charge", body, 200, {"status": "payment_staged"})
-    return jsonify({"message": "Payment staged for device."}), 200
-
-
-@app.route("/api/pos/reset", methods=["POST"])
-def pos_reset():
-    """Web UI calls this to tell the phone to sync/reset terminal settings."""
-    if not _check_secret():
-        return jsonify({"error": "unauthorized"}), 401
-    
-    _pending_reset["device_1"] = True
-    _log_call("pos-reset", {}, 200, {"status": "reset_requested"})
-    return jsonify({"message": "Reset/Sync command sent to phone."}), 200
-
-
-@app.route("/api/device/poll", methods=["GET"])
-def device_poll():
-    """Android app calls this repeatedly to check for pending payments or reset signals."""
-    
-    # Check if a reset was requested
-    if _pending_reset.get("device_1"):
-        _pending_reset["device_1"] = False  # Clear the flag
-        return jsonify({
-            "has_payment": False,
-            "should_reset": True
-        }), 200
-
-    # Otherwise check for pending payments
-    payment = _pending_payments.get("device_1")
-    if payment and payment["status"] == "pending":
-        payment["status"] = "processing"
-        return jsonify({
-            "has_payment": True,
-            "should_reset": False,
-            "amount": payment["amount"],
-            "currency": payment["currency"]
-        }), 200
-        
-    return jsonify({"has_payment": False, "should_reset": False}), 200
-
-
 @app.route("/payment-result", methods=["POST"])
 def payment_result():
     """
@@ -232,6 +201,158 @@ def payment_result():
     _log_call("payment-result", summary, 200, body)
 
     return jsonify({"status": "logged"}), 200
+
+
+@app.route("/api/device/poll", methods=["GET"])
+def device_poll():
+    """
+    Polled by the Android app every ~3s. Returns whatever's currently
+    queued, then clears the payment flag (should_reset also clears) so the
+    same command doesn't fire twice.
+    """
+    global _device_queue
+
+    result = dict(_device_queue)
+
+    if _device_queue["has_payment"] or _device_queue["should_reset"]:
+        print(f"\n--- /api/device/poll: delivering queued command ---")
+        print(f"  {result}")
+
+    # Clear after delivering once.
+    _device_queue["has_payment"] = False
+    _device_queue["amount"] = None
+    _device_queue["currency"] = None
+    _device_queue["should_reset"] = False
+
+    return jsonify(result), 200
+
+
+@app.route("/api/device/queue-payment", methods=["POST"])
+def queue_payment():
+    """
+    Call this to remotely trigger a payment on the phone. Expects JSON:
+      { "amount": "10", "currency": "EUR" }
+    The phone will wake, come to the foreground, and start a Tap to Pay
+    transaction with these values on its next poll (within ~3s).
+    """
+    if not _check_secret():
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    amount = body.get("amount", "5")
+    currency = body.get("currency", "EUR")
+
+    _device_queue["has_payment"] = True
+    _device_queue["amount"] = amount
+    _device_queue["currency"] = currency
+
+    print(f"\n--- /api/device/queue-payment: queued {amount} {currency} ---")
+    _log_call("queue-payment", {"amount": amount, "currency": currency}, 200, "queued")
+
+    return jsonify({"status": "queued", "amount": amount, "currency": currency}), 200
+
+
+@app.route("/api/device/queue-reset", methods=["POST"])
+def queue_reset():
+    """Call this to remotely force the phone to clear/re-establish its session."""
+    if not _check_secret():
+        return jsonify({"error": "unauthorized"}), 401
+
+    _device_queue["should_reset"] = True
+
+    print(f"\n--- /api/device/queue-reset: queued session reset ---")
+    _log_call("queue-reset", {}, 200, "queued")
+
+    return jsonify({"status": "queued"}), 200
+
+
+@app.route("/api/device/register-token", methods=["POST"])
+def register_token():
+    """
+    Called by the app whenever it gets a new FCM token (see FcmService.onNewToken).
+    Expects JSON: { "token": "..." }
+    """
+    body = request.get_json(silent=True) or {}
+    token = body.get("token")
+    if not token:
+        return jsonify({"error": "Missing 'token'"}), 400
+
+    _device_fcm_token["token"] = token
+    print(f"\n--- /api/device/register-token: stored new token ---")
+    print(f"  token (first 20 chars): {token[:20]}...")
+
+    return jsonify({"status": "registered"}), 200
+
+
+@app.route("/api/device/push-payment", methods=["POST"])
+def push_payment():
+    """
+    Sends a push notification to the phone to trigger a payment, waking it
+    even if backgrounded/locked/killed. Expects JSON:
+      { "amount": "10", "currency": "EUR" }
+    """
+    if not _check_secret():
+        return jsonify({"error": "unauthorized"}), 401
+
+    if not _firebase_ready:
+        return jsonify({"error": "Firebase not configured on this server"}), 500
+
+    token = _device_fcm_token.get("token")
+    if not token:
+        return jsonify({"error": "No device has registered an FCM token yet"}), 400
+
+    body = request.get_json(silent=True) or {}
+    amount = body.get("amount", "5")
+    currency = body.get("currency", "EUR")
+
+    message = messaging.Message(
+        data={
+            "amount": str(amount),
+            "currency": str(currency),
+            "should_reset": "false",
+        },
+        token=token,
+        android=messaging.AndroidConfig(priority="high"),
+    )
+
+    try:
+        response = messaging.send(message)
+        print(f"\n--- /api/device/push-payment: sent {amount} {currency} ---")
+        print(f"  FCM message id: {response}")
+        _log_call("push-payment", {"amount": amount, "currency": currency}, 200, response)
+        return jsonify({"status": "sent", "message_id": response}), 200
+    except Exception as e:
+        print(f"  -> FCM send failed: {e}")
+        return jsonify({"error": f"Failed to send push: {e}"}), 502
+
+
+@app.route("/api/device/push-reset", methods=["POST"])
+def push_reset():
+    """Sends a push telling the phone to clear/re-establish its session."""
+    if not _check_secret():
+        return jsonify({"error": "unauthorized"}), 401
+
+    if not _firebase_ready:
+        return jsonify({"error": "Firebase not configured on this server"}), 500
+
+    token = _device_fcm_token.get("token")
+    if not token:
+        return jsonify({"error": "No device has registered an FCM token yet"}), 400
+
+    message = messaging.Message(
+        data={"should_reset": "true"},
+        token=token,
+        android=messaging.AndroidConfig(priority="high"),
+    )
+
+    try:
+        response = messaging.send(message)
+        print(f"\n--- /api/device/push-reset: sent ---")
+        _log_call("push-reset", {}, 200, response)
+        return jsonify({"status": "sent", "message_id": response}), 200
+    except Exception as e:
+        print(f"  -> FCM send failed: {e}")
+        return jsonify({"error": f"Failed to send push: {e}"}), 502
 
 
 @app.route("/health", methods=["GET"])
@@ -275,7 +396,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .card { border: 1px solid #ddd; border-radius: 8px; padding: 18px 20px; margin-bottom: 18px; }
   .card h2 { font-size: 15px; margin: 0 0 10px; }
   .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
-  input[type=text], input[type=number] { flex: 1; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; }
+  input[type=text] { flex: 1; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; }
   button { padding: 8px 16px; border: none; border-radius: 6px; background: #0a5cff;
            color: white; font-size: 13px; cursor: pointer; }
   button:hover { background: #0847cc; }
@@ -290,50 +411,58 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .muted { color: #888; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
            background: #eee; margin-right: 6px; }
-  .pos-section { background: #eef5ff; border-color: #bbd6fe; }
 </style>
 </head>
 <body>
 
 <h1>Tap to Pay - backend test console</h1>
-<div class="sub">Talks directly to this Flask backend.</div>
-
-<!-- POS SECTION -->
-<div class="card pos-section">
-  <h2>🛒 Web Point of Sale (Send Payment to Phone)</h2>
-  <div class="sub" style="margin-bottom:10px;">
-    Enter an amount here. Payment will be staged first. The App is then programmed to check <code>/api/device/poll</code> to pick up this request and start the NFC reader.
-  </div>
-  <div class="row">
-    <input type="number" id="posAmount" placeholder="Amount (e.g. 5.00)" value="5.00">
-    <input type="text" id="posCurrency" placeholder="Currency" value="EUR" style="max-width: 80px;">
-    <button onclick="sendToPhone()">Send to Phone</button>
-  </div>
-  <div class="row" style="margin-top: 10px;">
-    <button class="secondary" onclick="resetPhone()">🔄 Sync / Reset Terminal</button>
-  </div>
-  <pre id="posResult" style="display:none; margin-top:12px;"></pre>
+<div class="sub">
+  Talks directly to this Flask backend. Note: this cannot trigger an actual
+  NFC card tap -- that only happens inside the Android app on a physical
+  phone. Use this to test the session-establishment call and inspect what
+  Adyen's servers return.
 </div>
 
 <div class="card">
   <h2>Backend status</h2>
-  <div id="status">checking...</div>
+  <div id="status"><span class="muted">Not checked yet.</span></div>
+  <button class="secondary" style="margin-top:10px;" onclick="loadStatus(1)">Check status</button>
 </div>
 
-<div class="card" style="display:none;">
+<div class="card">
   <h2>Dashboard secret</h2>
+  <div class="sub" style="margin-bottom:10px;">
+    Only needed if you've set DASHBOARD_SECRET as an environment variable on
+    the server. Stored in this browser tab only, never saved.
+  </div>
   <div class="row">
-    <input type="text" id="dashSecret" placeholder="x-dashboard-secret value">
+    <input type="text" id="dashSecret" placeholder="x-dashboard-secret value (leave blank if not set)">
   </div>
 </div>
 
 <div class="card">
   <h2>Test /establish-session</h2>
   <div class="row">
-    <input type="text" id="setupToken" placeholder="setupToken">
+    <input type="text" id="setupToken" placeholder="setupToken (from the Android app's authenticate() callback)">
   </div>
   <button onclick="testEstablish()">Send</button>
   <pre id="establishResult" style="display:none; margin-top:12px;"></pre>
+</div>
+
+<div class="card">
+  <h2>Remote trigger (Web POS)</h2>
+  <div class="sub" style="margin-bottom:10px;">
+    Queues a command for the phone's next poll (~3s). The phone will wake
+    and come to the foreground automatically -- only use this on a device
+    you control and expect this on.
+  </div>
+  <div class="row">
+    <input type="text" id="remoteAmount" placeholder="Amount" value="5" style="max-width:120px;">
+    <input type="text" id="remoteCurrency" placeholder="Currency" value="EUR" style="max-width:100px;">
+    <button onclick="queuePayment()">Send payment to device</button>
+  </div>
+  <button class="secondary" onclick="queueReset()">Force session reset</button>
+  <pre id="remoteResult" style="display:none; margin-top:12px;"></pre>
 </div>
 
 <div class="card">
@@ -343,57 +472,67 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-async function sendToPhone() {
-  const amount = document.getElementById('posAmount').value;
-  const currency = document.getElementById('posCurrency').value;
-  const secret = document.getElementById('dashSecret').value.trim();
-  const out = document.getElementById('posResult');
-  out.style.display = 'block';
-  out.textContent = 'Sending to queue...';
-  
+async function loadStatus(attempt) {
+  attempt = attempt || 1;
+  const el = document.getElementById('status');
+  if (attempt === 1) {
+    el.innerHTML = '<span class="muted">Checking (may take up to a minute if the server was asleep)...</span>';
+  }
   try {
-    const res = await fetch('/api/pos/charge', {
+    const health = await fetch('/health').then(r => r.json());
+    const cfg = await fetch('/api/config-check').then(r => r.json());
+    let html = '<span class="status-ok">Server running</span><br>';
+    html += cfg.api_key_set
+      ? '<span class="status-ok">API key configured</span><br>'
+      : '<span class="status-bad">API key still a placeholder -- edit app.py</span><br>';
+    html += cfg.merchant_account_set
+      ? '<span class="status-ok">Merchant account: ' + cfg.merchant_account + '</span>'
+      : '<span class="status-bad">Merchant account still a placeholder -- edit app.py</span>';
+    el.innerHTML = html;
+  } catch (e) {
+    if (attempt < 6) {
+      setTimeout(() => loadStatus(attempt + 1), 5000);
+      el.innerHTML = '<span class="muted">Still waking up server, retrying (' + attempt + '/6)...</span>';
+    } else {
+      el.innerHTML = '<span class="status-bad">Cannot reach backend</span> <button class="secondary" onclick="loadStatus(1)">Retry</button>';
+    }
+  }
+}
+
+async function queuePayment() {
+  const amount = document.getElementById('remoteAmount').value.trim();
+  const currency = document.getElementById('remoteCurrency').value.trim();
+  const secret = document.getElementById('dashSecret').value.trim();
+  const out = document.getElementById('remoteResult');
+  out.style.display = 'block';
+  out.textContent = 'Sending...';
+  try {
+    const res = await fetch('/api/device/queue-payment', {
       method: 'POST',
       headers: {'content-type': 'application/json', 'x-dashboard-secret': secret},
       body: JSON.stringify({amount, currency})
     });
     const data = await res.json();
-    out.textContent = 'Success: ' + data.message + '\\n\\n(Now your Android app needs to poll /api/device/poll to see it)';
+    out.textContent = 'Status: ' + res.status + '\\n\\n' + JSON.stringify(data, null, 2);
   } catch (e) {
-    out.textContent = 'Error: ' + e;
+    out.textContent = 'Request failed: ' + e;
   }
-  loadRecent();
 }
 
-async function resetPhone() {
+async function queueReset() {
   const secret = document.getElementById('dashSecret').value.trim();
-  const out = document.getElementById('posResult');
+  const out = document.getElementById('remoteResult');
   out.style.display = 'block';
-  out.textContent = 'Sending reset command to phone...';
-  
+  out.textContent = 'Sending...';
   try {
-    const res = await fetch('/api/pos/reset', {
+    const res = await fetch('/api/device/queue-reset', {
       method: 'POST',
       headers: {'content-type': 'application/json', 'x-dashboard-secret': secret}
     });
     const data = await res.json();
-    out.textContent = 'Command Sent: ' + data.message;
+    out.textContent = 'Status: ' + res.status + '\\n\\n' + JSON.stringify(data, null, 2);
   } catch (e) {
-    out.textContent = 'Error: ' + e;
-  }
-  loadRecent();
-}
-
-async function loadStatus(attempt) {
-  attempt = attempt || 1;
-  const el = document.getElementById('status');
-  try {
-    const cfg = await fetch('/api/config-check').then(r => r.json());
-    let html = '<span class="status-ok">Server running</span><br>';
-    html += cfg.api_key_set ? '<span class="status-ok">API key configured</span><br>' : '<span class="status-bad">API key missing</span><br>';
-    el.innerHTML = html;
-  } catch (e) {
-    el.innerHTML = '<span class="status-bad">Cannot reach backend</span>';
+    out.textContent = 'Request failed: ' + e;
   }
 }
 
@@ -402,6 +541,7 @@ async function testEstablish() {
   const secret = document.getElementById('dashSecret').value.trim();
   const out = document.getElementById('establishResult');
   out.style.display = 'block';
+  out.textContent = 'Sending...';
   try {
     const res = await fetch('/establish-session', {
       method: 'POST',
@@ -423,10 +563,15 @@ async function loadRecent() {
     const calls = await fetch('/api/recent-calls', {
       headers: {'x-dashboard-secret': secret}
     }).then(r => r.json());
-    if (!calls.length) { el.innerHTML = '<span class="muted">No calls yet.</span>'; return; }
+    if (!calls.length) {
+      el.innerHTML = '<span class="muted">No calls yet.</span>';
+      return;
+    }
     el.innerHTML = calls.map(c => `
       <div class="log-entry">
-        <span class="badge">${c.time}</span> <span class="badge">${c.kind}</span>
+        <span class="badge">${c.time}</span>
+        <span class="badge">${c.kind}</span>
+        <span class="${c.status === 201 || c.status === 200 ? 'status-ok' : 'status-bad'}">status ${c.status}</span>
         <pre>${JSON.stringify(c.response, null, 2)}</pre>
       </div>
     `).join('');
@@ -435,7 +580,6 @@ async function loadRecent() {
   }
 }
 
-loadStatus();
 loadRecent();
 </script>
 
